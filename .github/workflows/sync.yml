@@ -1,0 +1,152 @@
+name: Sync full apache/thrift snapshot as a detached tag + release
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+
+      - name: Determine upstream release + own sync state
+        id: state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: apache/thrift
+        run: |
+          set -euo pipefail
+
+          latest_tag=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name')
+          latest_sha=$(gh api "repos/${UPSTREAM}/git/ref/tags/${latest_tag}" --jq '.object.sha')
+          echo "Latest upstream release: ${latest_tag} (${latest_sha})"
+
+          # Match the upstream tag itself or any vX.Y.Z.N patch-label variant of it.
+          # The .N suffix is a manual escape hatch for when Packagist's immutable-versions
+          # policy blocks re-syncing a tag (e.g. after it got re-tagged during debugging);
+          # the fix is to publish the same content under a bumped label rather than retag,
+          # so once any such variant exists this release counts as already synced.
+          escaped_tag=$(printf '%s' "${latest_tag}" | sed 's/[.[\*^$/]/\\&/g')
+          version_pattern="^${escaped_tag}(\.[0-9]+)?\$"
+
+          tag_exists=false
+          if gh api "repos/${GITHUB_REPOSITORY}/tags" --paginate --jq '.[].name' | grep -qE "${version_pattern}"; then
+            tag_exists=true
+          fi
+
+          release_exists=false
+          if gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[].tag_name' | grep -qE "${version_pattern}"; then
+            release_exists=true
+          fi
+
+          if [ "${tag_exists}" = true ] && [ "${release_exists}" = true ]; then
+            echo "Already in sync with ${latest_tag} (tag + release both exist, possibly under a .N variant), nothing to do."
+          fi
+
+          {
+            echo "tag=${latest_tag}"
+            echo "sha=${latest_sha}"
+            echo "tag_exists=${tag_exists}"
+            echo "release_exists=${release_exists}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build full snapshot commit and push as a detached tag
+        if: steps.state.outputs.tag_exists == 'false'
+        env:
+          UPSTREAM: apache/thrift
+          TAG: ${{ steps.state.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.state.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          workdir=$(mktemp -d)
+          git clone --depth 1 --branch "${TAG}" "https://github.com/${UPSTREAM}.git" "${workdir}/src"
+          rm -rf "${workdir}/src/.git"
+
+          # Drop upstream's own .github/ entirely: GitHub refuses GITHUB_TOKEN
+          # pushes that touch .github/workflows/** (needs a PAT with `workflow`
+          # scope, which we don't want to require), and we don't want upstream's
+          # CI workflows executing against this repo's Actions runners anyway.
+          rm -rf "${workdir}/src/.github"
+
+          # Rewrite composer.json's "name" to this repo (Packagist requires every
+          # version of a package to declare the same name; upstream's own tags say
+          # "apache/thrift", which would make every tagged version get rejected by
+          # Packagist as a name mismatch against the package registered from master).
+          # Also declare a conflict with the real apache/thrift package: both provide
+          # the same Thrift\ namespace, so Composer must refuse to install both at once
+          # rather than silently letting one clobber the other's classes.
+          repo_name_lower=$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          jq --indent 4 --arg name "${repo_name_lower}" '.name = $name | .conflict = {"apache/thrift": "*"}' "${workdir}/src/composer.json" > "${workdir}/src/composer.json.new"
+          mv "${workdir}/src/composer.json.new" "${workdir}/src/composer.json"
+
+          # Derive .gitattributes export-ignore rules from upstream's own composer.json
+          # archive.exclude list, so a source-zip / composer dist download of this tag
+          # yields the same PHP-library-only subset that block already documents.
+          # Order matters: gitattributes resolves each attribute by last-match-wins, and
+          # the array is already ordered exclude-everything-then-include-specifics.
+          #
+          # Unlike Composer's own archiver, git-archive prunes a whole directory as soon
+          # as the directory entry itself is export-ignore'd — an unignore rule on a leaf
+          # path alone doesn't help if an ancestor directory is still ignored. So every
+          # "!"-prefixed entry also unignores each of its ancestor directories, plus a
+          # trailing /** so directory entries (e.g. lib/php/lib) unignore their contents.
+          jq -r '.archive.exclude[]' "${workdir}/src/composer.json" | while IFS= read -r entry; do
+            if [[ "${entry}" == '!'* ]]; then
+              path="${entry#!}"
+              IFS='/' read -ra parts <<< "${path#/}"
+              prefix=""
+              for part in "${parts[@]}"; do
+                prefix="${prefix}/${part}"
+                echo "${prefix} -export-ignore"
+              done
+              echo "${path}/** -export-ignore"
+            else
+              echo "${entry} export-ignore"
+            fi
+          done >> "${workdir}/src/.gitattributes"
+
+          composer validate --no-check-publish --no-interaction --working-dir "${workdir}/src"
+
+          git -C "${workdir}/src" init -q -b snapshot
+          git -C "${workdir}/src" config user.name "github-actions[bot]"
+          git -C "${workdir}/src" config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C "${workdir}/src" add -A
+          git -C "${workdir}/src" commit -q -m "$(printf 'Snapshot %s@%s\n\nUpstream commit: %s\nUpstream tree: https://github.com/%s/tree/%s' "${UPSTREAM}" "${TAG}" "${UPSTREAM_SHA}" "${UPSTREAM}" "${TAG}")"
+
+          # Pull the snapshot commit into this checkout without attaching it to any
+          # branch, then push only the tag ref — the commit stays detached on origin too.
+          git fetch "${workdir}/src" snapshot
+          git tag "${TAG}" FETCH_HEAD
+          git push origin "refs/tags/${TAG}"
+
+      - name: Publish GitHub release
+        if: steps.state.outputs.release_exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: apache/thrift
+          TAG: ${{ steps.state.outputs.tag }}
+          UPSTREAM_SHA: ${{ steps.state.outputs.sha }}
+        run: |
+          set -euo pipefail
+
+          upstream_release=$(gh api "repos/${UPSTREAM}/releases/tags/${TAG}")
+          upstream_body=$(echo "${upstream_release}" | jq -r '.body // ""')
+          upstream_url=$(echo "${upstream_release}" | jq -r '.html_url')
+
+          notes_file=$(mktemp)
+          {
+            printf '_Mirrors upstream release [%s](%s) — upstream commit `%s`._\n\n' "${UPSTREAM}@${TAG}" "${upstream_url}" "${UPSTREAM_SHA}"
+            printf '_This tag has no parent commit and is not reachable from any branch — see the repo README._\n\n'
+            printf -- '---\n\n'
+            printf '%s\n' "${upstream_body}"
+          } > "${notes_file}"
+
+          gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --title "${TAG}" --notes-file "${notes_file}"
